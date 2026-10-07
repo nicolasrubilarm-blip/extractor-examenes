@@ -1,2 +1,579 @@
 <!DOCTYPE html>
-<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Extractor de exámenes</title></head><body><h1>Extractor de exámenes</h1><p>Se subirá la versión completa corregida en el siguiente paso.</p></body></html> 
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Extracción de exámenes</title>
+<style>
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family:Arial,Helvetica,sans-serif;
+    background:#f5f7fa;
+    color:#18212b;
+  }
+  .wrap{max-width:900px;margin:0 auto;padding:24px}
+  .card{
+    background:#fff;
+    border:1px solid #d9e0e7;
+    border-radius:14px;
+    padding:18px;
+    margin-bottom:16px;
+    box-shadow:0 2px 10px rgba(0,0,0,.03)
+  }
+  h1{font-size:24px;margin:0 0 2px}
+  .credit{font-size:12px;color:#657280;opacity:.7}
+  .drop{
+    display:block;
+    border:2px dashed #b8c3cf;
+    border-radius:12px;
+    padding:28px;
+    text-align:center;
+    background:#fafbfd;
+    cursor:pointer;
+    margin-top:16px
+  }
+  .drop.drag{border-color:#5b7cff;background:#f3f6ff}
+  input[type=file]{display:none}
+  button{
+    border:0;border-radius:9px;padding:10px 14px;font-size:14px;
+    cursor:pointer;margin:10px 6px 0 0
+  }
+  .primary{background:#1f6feb;color:#fff}
+  .secondary{background:#e9eef4;color:#1d2935}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .status{font-size:13px;color:#52606d;margin-top:10px;min-height:18px;white-space:pre-wrap}
+  textarea{
+    width:100%;min-height:320px;border:1px solid #cfd7e0;border-radius:10px;
+    padding:14px;font-family:Arial,Helvetica,sans-serif;font-size:15px;
+    line-height:1.5;resize:vertical
+  }
+  .result-title{font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Extracción de exámenes</h1>
+    <div class="credit">Creado por Nicolás Rubilar Muñoz</div>
+
+    <label class="drop" id="drop">
+      <strong>Haz clic para seleccionar el PDF</strong><br>
+      <span style="font-size:13px;color:#657280">También puedes arrastrarlo aquí</span>
+      <input id="file" type="file" accept=".pdf,application/pdf">
+    </label>
+
+    <div id="status" class="status"></div>
+
+    <button class="primary" id="process" disabled>Extraer y ordenar</button>
+    <button class="secondary" id="copy" disabled>Copiar resultado</button>
+    <button class="secondary" id="clear">Limpiar</button>
+  </div>
+
+  <div class="card">
+    <div class="result-title">Resultado</div>
+    <div style="height:10px"></div>
+    <textarea id="out" placeholder="Aquí aparecerá el resultado..."></textarea>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js";
+
+const fileInput = document.getElementById("file");
+const drop = document.getElementById("drop");
+const status = document.getElementById("status");
+const processBtn = document.getElementById("process");
+const copyBtn = document.getElementById("copy");
+const clearBtn = document.getElementById("clear");
+const out = document.getElementById("out");
+
+let selectedFile = null;
+
+/* =========================================================
+   1) PDF -> páginas con coordenadas
+   ========================================================= */
+async function getPages(file){
+  const buffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({data: buffer}).promise;
+  const pages = [];
+
+  for(let pageNumber=1; pageNumber<=pdf.numPages; pageNumber++){
+    const page = await pdf.getPage(pageNumber);
+    const content = await page.getTextContent();
+    const words = [];
+
+    for(const item of content.items){
+      if(!item || typeof item.str !== "string" || !item.str.trim()) continue;
+      const tr = item.transform || [];
+      const x = Number(tr[4] || 0);
+      const y = Number(tr[5] || 0);
+      words.push({
+        text:item.str.trim(),
+        x0:x,
+        x1:x + Number(item.width || 0),
+        top:y
+      });
+    }
+
+    pages.push(words);
+  }
+  return pages;
+}
+
+function norm(s){
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g,"")
+    .replace(/\s+/g," ")
+    .trim();
+}
+
+function sameY(a,b,tol=2){
+  return Math.abs(a-b)<=tol;
+}
+
+function rowAtY(words,y,tol=2){
+  return words
+    .filter(w=>sameY(w.top,y,tol))
+    .sort((a,b)=>a.x0-b.x0);
+}
+
+function uniqueYs(words){
+  return [...new Set(words.map(w=>Math.round(w.top*10)/10))].sort((a,b)=>a-b);
+}
+
+function join(ws){
+  return ws.map(w=>w.text).join(" ").replace(/\s+([:;,])/g,"$1").trim();
+}
+
+function detectSection(words){
+  const t = norm(words.map(w=>w.text).join(" "));
+  if(t.includes("quimica sanguinea")) return "Química sanguínea";
+  if(t.includes("relacion microalbuminuria/creatininuria")) return "Relación Microalbuminuria/Creatininuria";
+  if(t.includes("hemograma vhs")) return "Hemograma VHS";
+  if(t.includes("orina completa")) return "Orina completa";
+  if(t.includes("perfil lipidico")) return "Perfil lipídico";
+  if(t.includes("hemoglobina glicada")) return "Hemoglobina glicada";
+  if(t.includes("hemorragias ocultas en deposiciones") || t.includes("sangre oculta en deposiciones") || t.includes("hemorragia oculta en deposiciones") || t.includes("sangre oculta deposiciones")) return "Hemorragias ocultas en deposiciones";
+  if(t.includes("hormonas")) return "Hormonas";
+  return null;
+}
+
+/* =========================================================
+   2) Tablas: detectar columnas a partir de los encabezados
+   ========================================================= */
+function findColumnAnchors(words){
+  let resultX = null;
+  let unitX = null;
+  let refX = null;
+
+  for(const w of words){
+    const n=norm(w.text);
+    if(n==="resultado"){
+      resultX = w.x0;
+    }else if(n==="unidad"){
+      unitX = w.x0;
+    }else if(n==="referencia" || n==="valor"){
+      if(refX===null) refX=w.x0;
+    }
+  }
+
+  // En estos informes la columna de referencia puede ser detectada por
+  // "Referencia"; "Valor" pertenece a la línea superior de esa misma columna.
+  if(refX===null){
+    for(const w of words){
+      if(norm(w.text)==="intervalo") refX=w.x0;
+    }
+  }
+
+  // Fallback para el formato Hospital Los Lagos.
+  if(resultX===null) resultX=204;
+  if(unitX===null) unitX=286;
+  if(refX===null) refX=360;
+
+  return {
+    resultStart: resultX - 18,
+    resultEnd: unitX - 10,
+    unitStart: unitX - 10,
+    unitEnd: refX - 10
+  };
+}
+
+const LABELS = {
+  "Química sanguínea":[
+    ["Ácido Úrico, En Sangre","Ácido úrico"],
+    ["Ácido Urico, En Sangre","Ácido úrico"],
+    ["Albúminas En Sangre","Albúmina"],
+    ["Albuminas En Sangre","Albúmina"],
+    ["Creatinina En Sangre","Cr"],
+    ["VFG MDRD-IDMS","VFG"],
+    ["Glucosa En Sangre","Glicemia"],
+    ["Nitrógeno Ureico","BUN"],
+    ["Uremia","Uremia"],
+    ["Proteinas Totales","Proteínas totales"],
+    ["Proteínas Totales","Proteínas totales"],
+    ["Sodio","Sodio"],
+    ["Potasio","Potasio"],
+    ["Cloro","Cloro"]
+  ],
+  "Relación Microalbuminuria/Creatininuria":[
+    ["Microalbuminuria","Microalbuminuria"],
+    ["Creatininuria","Creatininuria"],
+    ["Relacion Microalbuminuria/Creatininuria","RAC"]
+  ],
+  "Hemograma VHS":[
+    ["Eritrocitos","GR"],
+    ["Hemoglobina","Hb"],
+    ["Hematocrito","Hto"],
+    ["VCM","VCM"],
+    ["H.C.M","HCM"],
+    ["C.H.C.M","CHCM"],
+    ["RDW-CV","RDW"],
+    ["Rcto. Leucocitos","Leu"],
+    ["Rcto. Absoluto Eosinófilos","Eos"],
+    ["Rcto. Absoluto Basófilos","Bas"],
+    ["Rcto. Absoluto Neutrófilos","Neut"],
+    ["Rcto. Absoluto Monocitos","Mono"],
+    ["Rcto. Absoluto Linfocitos","Linf"],
+    ["Rcto. Plaquetas","Plq"],
+    ["MPV","MPV"],
+    ["VHS","VHS"]
+  ],
+  "Perfil lipídico":[
+    ["Indice Col. Total / Col. HDL","CT/HDL"],
+    ["Colesterol Total","CT"],
+    ["Colesterol HDL","HDL"],
+    ["Colesterol LDL","LDL"],
+    ["Trigliceridos","TG"],
+    ["Triglicéridos","TG"],
+    ["Colesterol VLDL","VLDL"],
+    ["Relacion LDL/HDL","LDL/HDL"]
+  ],
+  "Hemoglobina glicada":[
+    ["Hemoglobina Glicada A1c","HbA1c"],
+    ["Hemoglobina Glicada","HbA1c"]
+  ],
+  "Hemorragias ocultas en deposiciones":[
+    ["Hemorragias Ocultas En Deposiciones","Hemorragias ocultas en deposiciones"],
+    ["Hemorragia Oculta En Deposiciones","Hemorragias ocultas en deposiciones"],
+    ["Sangre Oculta En Deposiciones","Hemorragias ocultas en deposiciones"],
+    ["Sangre Oculta en Deposiciones","Hemorragias ocultas en deposiciones"],
+    ["Test De Sangre Oculta En Deposiciones","Hemorragias ocultas en deposiciones"],
+    ["Test De Guayaco","Hemorragias ocultas en deposiciones"]
+  ],
+  "Hormonas":[
+    ["Antigeno Prostatico Especifico Total","PSA total"],
+    ["Antígeno Prostático Específico Total","PSA total"],
+    ["PSAT","PSA total"]
+  ]
+};
+
+function findDefinition(label, defs){
+  const n=norm(label);
+  for(const [sourceName,displayName] of defs){
+    const a=norm(sourceName);
+    if(n===a || n.startsWith(a+" ")) return {sourceName,displayName};
+  }
+  return null;
+}
+
+function cleanValue(v){
+  return String(v || "")
+    .replace(/\s+/g," ")
+    .replace(/^\s+|\s+$/g,"")
+    .replace(/(?<=\d)\.(?=\d)/g,",");
+}
+
+function readStandardPage(words, section){
+  const defs=LABELS[section];
+  if(!defs) return [];
+
+  const c=findColumnAnchors(words);
+  const rows=[];
+  const seenNames=new Set();
+
+  for(const y of uniqueYs(words)){
+    const row=rowAtY(words,y,2);
+    if(!row.length) continue;
+
+    const left=row.filter(w=>w.x0<c.resultStart);
+    const label=join(left);
+    const def=findDefinition(label,defs);
+    if(!def) continue;
+
+    const resultItems=row.filter(w=>w.x0>=c.resultStart && w.x0<c.resultEnd);
+    const unitItems=row.filter(w=>w.x0>=c.unitStart && w.x0<c.unitEnd);
+
+    if(!resultItems.length) continue;
+
+    let value=join(resultItems);
+    let unit=join(unitItems);
+
+    // El informe puede agregar una marca H/L junto al resultado.
+    let marker="";
+    const markerMatch=value.match(/\s+(h|l|↑|↓)$/i);
+    if(markerMatch){
+      marker=markerMatch[1];
+      value=value.slice(0,-markerMatch[0].length).trim();
+    }
+
+    value=cleanValue(value);
+    if(!value) continue;
+
+    if(seenNames.has(def.displayName)) continue;
+    seenNames.add(def.displayName);
+
+    rows.push({
+      name:def.displayName,
+      value,
+      unit,
+      marker,
+      y
+    });
+  }
+
+  return rows;
+}
+
+/* =========================================================
+   3) Fórmula diferencial del hemograma
+   ========================================================= */
+function readDifferential(words){
+  const labels=[
+    "Segmentados(%)","Linfocitos(%)","Monocitos(%)","Eosinófilos(%)",
+    "Basófilos(%)","Baciliformes(%)","Juveniles(%)","Mielocitos(%)",
+    "Promielocitos(%)","Blastos(%)"
+  ];
+
+  // Localizar fila "Resultado" del bloque diferencial y la fila numérica siguiente.
+  let headerY=null;
+  for(const w of words){
+    if(norm(w.text)==="resultado" && w.top>500){
+      headerY=w.top;
+      break;
+    }
+  }
+  if(headerY===null) return [];
+
+  const candidates=words.filter(w=>w.top>headerY && w.top<headerY+50 && /^-?\d+(?:[.,]\d+)?$/.test(w.text));
+  if(candidates.length<8) return [];
+
+  // En Hospital Los Lagos los resultados están todos en una sola línea.
+  const ys=uniqueYs(candidates);
+  let bestY=null,best=[];
+  for(const y of ys){
+    const r=candidates.filter(w=>sameY(w.top,y,2)).sort((a,b)=>a.x0-b.x0);
+    if(r.length>best.length){best=r;bestY=y;}
+  }
+
+  if(!bestY || best.length<8) return [];
+
+  const out=[];
+  for(let i=0;i<Math.min(labels.length,best.length);i++){
+    const w=best[i];
+    out.push({
+      name:labels[i],
+      value:cleanValue(w.text),
+      unit:"%",
+      marker:"",
+      y:bestY
+    });
+  }
+
+  // Marcas H/L inmediatamente próximas a un valor.
+  const allRow=rowAtY(words,bestY,2);
+  for(let i=0;i<out.length;i++){
+    const target=best[i];
+    const flag=allRow.find(w=>/^(h|l|↑|↓)$/i.test(w.text) && Math.abs(w.x0-target.x1)<18);
+    if(flag) out[i].marker=flag.text;
+  }
+
+  return out;
+}
+
+/* =========================================================
+   4) Orina completa
+   ========================================================= */
+const URINE_LABELS=[
+  ["Color","Color"],["Aspecto","Aspecto"],["Densidad","Densidad"],["Ph","pH"],
+  ["Glucosa","Glucosa"],["Proteínas","Proteínas"],["Proteinas","Proteínas"],
+  ["Bilirrubina","Bilirrubina"],["Urobilinogeno","Urobilinógeno"],
+  ["Cuerpos Cetonicos","Cuerpos cetónicos"],["Cuerpos Cetónicos","Cuerpos cetónicos"],
+  ["Nitritos","Nitritos"],["Sangre","Sangre"],["Leucocitos","Leucocitos"],
+  ["Células Descamativas","Células descamativas"],["Eritrocitos","GR"],
+  ["Eritrocitos dismórficos","GR dismórficos"],["Bacterias","Bacterias"],
+  ["Cristales","Cristales"],["Cilindros","Cilindros"],["Mucus","Mucus"],
+  ["Levaduras","Levaduras"],["Trichomonas vaginalis","Trichomonas vaginalis"],
+  ["Piocitos","Piocitos"],["Placas de pus","Placas de pus"]
+];
+
+function readUrine(words){
+  const c=findColumnAnchors(words);
+  const ys=uniqueYs(words);
+  const rows=[];
+
+  for(let i=0;i<ys.length;i++){
+    const y=ys[i];
+    const row=rowAtY(words,y,2);
+    const left=row.filter(w=>w.x0<c.resultStart);
+    if(!left.length) continue;
+
+    const label=join(left);
+    let def=null;
+    for(const [src,display] of URINE_LABELS){
+      if(norm(label)===norm(src)){def={display};break;}
+    }
+    if(!def) continue;
+
+    let value=join(row.filter(w=>w.x0>=c.resultStart && w.x0<c.resultEnd));
+    const unit=join(row.filter(w=>w.x0>=c.unitStart && w.x0<c.unitEnd));
+
+    if(!value) continue;
+    rows.push({
+      name:def.display,
+      value:cleanValue(value),
+      unit,
+      marker:"",
+      y
+    });
+  }
+
+  return rows;
+}
+
+/* =========================================================
+   5) Construcción final
+      IMPORTANTE: se numera SOLO cada sección general.
+      Los parámetros NO llevan numeración.
+   ========================================================= */
+function buildOutput(sectionResults){
+  let number=1;
+  const lines=[];
+
+  for(const item of sectionResults){
+    if(!item.rows.length) continue;
+
+    const values=item.rows.map(r=>{
+      const marker=r.marker ? " "+r.marker : "";
+      const u=r.unit ? " "+r.unit : "";
+      return `${r.name}${marker} ${r.value}${u}`;
+    });
+
+    lines.push(`${number}. ${item.section}: ${values.join(" | ")}`);
+    number++;
+  }
+
+  return lines.join("\n");
+}
+
+/* =========================================================
+   UI
+   ========================================================= */
+function updateState(){
+  processBtn.disabled=!selectedFile;
+  copyBtn.disabled=!out.value.trim();
+}
+
+fileInput.addEventListener("change",e=>{
+  selectedFile=e.target.files && e.target.files[0] ? e.target.files[0] : null;
+  status.textContent=selectedFile ? `PDF seleccionado: ${selectedFile.name}` : "";
+  updateState();
+});
+
+drop.addEventListener("dragover",e=>{
+  e.preventDefault();
+  drop.classList.add("drag");
+});
+
+drop.addEventListener("dragleave",()=>{
+  drop.classList.remove("drag");
+});
+
+drop.addEventListener("drop",e=>{
+  e.preventDefault();
+  drop.classList.remove("drag");
+  selectedFile=e.dataTransfer.files && e.dataTransfer.files[0] ? e.dataTransfer.files[0] : null;
+  status.textContent=selectedFile ? `PDF seleccionado: ${selectedFile.name}` : "";
+  updateState();
+});
+
+clearBtn.addEventListener("click",()=>{
+  selectedFile=null;
+  fileInput.value="";
+  out.value="";
+  status.textContent="";
+  updateState();
+});
+
+copyBtn.addEventListener("click",async()=>{
+  try{
+    await navigator.clipboard.writeText(out.value);
+    status.textContent="Resultado copiado.";
+  }catch(err){
+    out.select();
+    document.execCommand("copy");
+    status.textContent="Resultado copiado.";
+  }
+});
+
+processBtn.addEventListener("click",async()=>{
+  if(!selectedFile) return;
+
+  processBtn.disabled=true;
+  copyBtn.disabled=true;
+  out.value="";
+  status.textContent="Extrayendo resultados...";
+
+  try{
+    const pages=await getPages(selectedFile);
+    const sectionResults=[];
+
+    for(const words of pages){
+      const section=detectSection(words);
+      if(!section) continue;
+
+      let rows=[];
+      if(section==="Orina completa"){
+        rows=readUrine(words);
+      }else{
+        rows=readStandardPage(words,section);
+        if(section==="Hemograma VHS"){
+          rows=rows.concat(readDifferential(words));
+        }
+      }
+
+      if(rows.length){
+        const uniqueRows=[];
+        const seenNames=new Set();
+        for(const r of rows){
+          if(seenNames.has(r.name)) continue;
+          seenNames.add(r.name);
+          uniqueRows.push(r);
+        }
+        sectionResults.push({section,rows:uniqueRows});
+      }
+    }
+
+    if(!sectionResults.length){
+      throw new Error("No se encontraron resultados en el PDF.");
+    }
+
+    out.value=buildOutput(sectionResults);
+    status.textContent=`Listo: ${sectionResults.length} sección(es) extraída(s).`;
+    copyBtn.disabled=!out.value.trim();
+  }catch(err){
+    console.error(err);
+    status.textContent="Error al procesar el PDF: "+(err && err.message ? err.message : "error desconocido");
+  }finally{
+    processBtn.disabled=!selectedFile;
+  }
+});
+
+updateState();
+</script>
+</body>
+</html>
